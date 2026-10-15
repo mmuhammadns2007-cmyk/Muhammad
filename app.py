@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -21,6 +22,10 @@ from pypdf import PdfReader
 # model, so the app keeps working when old versions are retired. To pin a
 # specific model, set GEMINI_MODEL in Streamlit secrets or as an env variable.
 DEFAULT_MODEL = "gemini-flash-latest"
+# Tried in order if the main model is overloaded or unavailable.
+FALLBACK_MODELS = ["gemini-flash-lite-latest"]
+RETRIES_PER_MODEL = 3  # attempts per model before moving to the next one
+RETRY_DELAY_SECONDS = 2  # doubles after each failed attempt (2s, 4s, ...)
 MAX_RESUME_CHARS = 20000  # keeps prompts small and fast
 MIN_RESUME_CHARS = 200  # below this the file is probably scanned / empty
 
@@ -156,8 +161,54 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def is_transient_error(exc: Exception) -> bool:
+    """True for temporary Google-side problems worth retrying (overload, rate limit)."""
+    msg = str(exc).upper()
+    return any(
+        k in msg
+        for k in ("503", "UNAVAILABLE", "500", "INTERNAL", "504", "DEADLINE", "429", "RESOURCE_EXHAUSTED", "OVERLOADED", "HIGH DEMAND")
+    )
+
+
+def is_model_missing_error(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    return "404" in msg or "NOT_FOUND" in msg
+
+
+def generate_with_retry(client, model, prompt, config, on_status=None, sleep=time.sleep):
+    """Call Gemini, retrying temporary errors, then falling back to other models."""
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_exc = None
+    for m in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return client.models.generate_content(
+                    model=m, contents=prompt, config=config
+                )
+            except Exception as exc:
+                last_exc = exc
+                if is_model_missing_error(exc):
+                    break  # this model name is gone - go to the next one
+                if not is_transient_error(exc):
+                    raise  # bad key, bad request, etc. - retrying won't help
+                if attempt < RETRIES_PER_MODEL - 1:
+                    if on_status:
+                        on_status(f"Gemini is busy, retrying ({attempt + 2}/{RETRIES_PER_MODEL})...")
+                    sleep(RETRY_DELAY_SECONDS * (2**attempt))
+                else:
+                    break  # retries used up - try the fallback model
+        if on_status and m != models[-1]:
+            on_status("Main model is busy, switching to a backup model...")
+    raise last_exc
+
+
 def analyze_resume(
-    client, resume_text: str, job_description: str = "", model: str = DEFAULT_MODEL
+    client,
+    resume_text: str,
+    job_description: str = "",
+    model: str = DEFAULT_MODEL,
+    on_status=None,
+    sleep=time.sleep,
 ) -> dict:
     jd_part = (
         f"\n\nJOB DESCRIPTION:\n{job_description.strip()[:8000]}\n\n"
@@ -174,14 +225,11 @@ def analyze_resume(
         f"Return JSON exactly in this shape:\n{JSON_SCHEMA_HINT}"
         f"{jd_part}\n\nRESUME:\n{resume_text[:MAX_RESUME_CHARS]}"
     )
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
     )
+    response = generate_with_retry(client, model, prompt, config, on_status, sleep)
     return normalize_result(parse_json_response(response.text))
 
 
@@ -321,9 +369,17 @@ def main() -> None:
             return
 
         try:
+            status = st.empty()
             with st.spinner("Analyzing with Gemini..."):
                 client = genai.Client(api_key=api_key)
-                result = analyze_resume(client, text, job_description, get_model_name())
+                result = analyze_resume(
+                    client,
+                    text,
+                    job_description,
+                    get_model_name(),
+                    on_status=lambda m: status.info(m),
+                )
+            status.empty()
         except Exception as exc:
             msg = str(exc)
             if "404" in msg or "NOT_FOUND" in msg:
@@ -334,8 +390,12 @@ def main() -> None:
                 )
             elif "API key" in msg or "API_KEY" in msg or "403" in msg:
                 st.error("Gemini rejected the request. Check that your API key is valid.")
-            elif "429" in msg or "quota" in msg.lower():
-                st.error("Rate limit reached. Wait a minute and try again.")
+            elif is_transient_error(exc):
+                st.error(
+                    "Google's Gemini servers are overloaded right now (tried several "
+                    "times, including a backup model). Please wait a minute and click "
+                    "Analyze again."
+                )
             else:
                 st.error(f"Analysis failed: {msg}")
             return
