@@ -17,7 +17,10 @@ from google import genai
 from google.genai import types
 from pypdf import PdfReader
 
-MODEL_NAME = "gemini-2.5-flash"
+# "gemini-flash-latest" is an alias that always points to Google's newest Flash
+# model, so the app keeps working when old versions are retired. To pin a
+# specific model, set GEMINI_MODEL in Streamlit secrets or as an env variable.
+DEFAULT_MODEL = "gemini-flash-latest"
 MAX_RESUME_CHARS = 20000  # keeps prompts small and fast
 MIN_RESUME_CHARS = 200  # below this the file is probably scanned / empty
 
@@ -153,7 +156,9 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(client, resume_text: str, job_description: str = "") -> dict:
+def analyze_resume(
+    client, resume_text: str, job_description: str = "", model: str = DEFAULT_MODEL
+) -> dict:
     jd_part = (
         f"\n\nJOB DESCRIPTION:\n{job_description.strip()[:8000]}\n\n"
         "Also score how well the resume matches this job (job_match_score) and list "
@@ -170,11 +175,10 @@ def analyze_resume(client, resume_text: str, job_description: str = "") -> dict:
         f"{jd_part}\n\nRESUME:\n{resume_text[:MAX_RESUME_CHARS]}"
     )
     response = client.models.generate_content(
-        model=MODEL_NAME,
+        model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            temperature=0.2,
             response_mime_type="application/json",
         ),
     )
@@ -194,15 +198,23 @@ def score_label(score: int) -> str:
     return "Poor"
 
 
-def get_api_key() -> str:
+def get_setting(name: str, default: str = "") -> str:
     # 1) Streamlit secrets (used on Streamlit Community Cloud)
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
+        if name in st.secrets:
+            return str(st.secrets[name])
     except Exception:
         pass  # no secrets file locally - that's fine
     # 2) Environment variable
-    return os.getenv("GEMINI_API_KEY", "")
+    return os.getenv(name, default)
+
+
+def get_api_key() -> str:
+    return get_setting("GEMINI_API_KEY")
+
+
+def get_model_name() -> str:
+    return get_setting("GEMINI_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL
 
 
 def render_results(result: dict, resume_text: str) -> None:
@@ -279,7 +291,7 @@ def main() -> None:
                 type="password",
                 help="Get a free key at https://aistudio.google.com/apikey",
             )
-        st.markdown(f"Model: `{MODEL_NAME}`")
+        st.markdown(f"Model: `{get_model_name()}`")
         st.info("Your resume is sent to Google's Gemini API for analysis.")
 
     uploaded = st.file_uploader("Upload resume (PDF or DOCX)", type=["pdf", "docx"])
@@ -311,10 +323,16 @@ def main() -> None:
         try:
             with st.spinner("Analyzing with Gemini..."):
                 client = genai.Client(api_key=api_key)
-                result = analyze_resume(client, text, job_description)
+                result = analyze_resume(client, text, job_description, get_model_name())
         except Exception as exc:
             msg = str(exc)
-            if "API key" in msg or "API_KEY" in msg or "403" in msg or "400" in msg:
+            if "404" in msg or "NOT_FOUND" in msg:
+                st.error(
+                    f"Model `{get_model_name()}` is not available. Set GEMINI_MODEL "
+                    "(in Streamlit secrets or as an env variable) to a current model "
+                    "name, e.g. gemini-flash-latest. Details: " + msg
+                )
+            elif "API key" in msg or "API_KEY" in msg or "403" in msg:
                 st.error("Gemini rejected the request. Check that your API key is valid.")
             elif "429" in msg or "quota" in msg.lower():
                 st.error("Rate limit reached. Wait a minute and try again.")
